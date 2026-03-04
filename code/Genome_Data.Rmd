@@ -1,0 +1,226 @@
+---
+title: "Genomic Epi Data"
+author: "Erika Austhof"
+date: "2026-02-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Obtain sequences off NCBI
+### Obtain list of the accession numbers from NCBI. 
+Navigate to Pathogen Detection https://www.ncbi.nlm.nih.gov/pathogens/ In the "Search isolates" field, enter the PulseNet ID for the genome you would like to use. If you have many IDs, copy and paste the list of IDs into the search bar (you can do this by copying the PNUSA_ID column from Excel and pasting into the search).
+
+In Pathogen Detection, select "Choose columns". Select all available columns.
+Select all isolates, and download the Excel file with the information.
+Save the file in your project folder.
+
+Open the Excel file and copy the "Assembly" column into a .txt file. Save as "Accessions.txt" These IDs (start with "GCA_") can be used in NCBI datasets to pull the assemblies off NCBI.
+
+### Download and Install NCBI Datasets
+#### Install using conda
+The NCBI Datasets CLI tools are available as a conda package that includes both datasets and dataformat.
+
+Create, activate the conda environment, and install the datasets package: 
+```{}
+conda create -n ncbi_datasets
+conda activate ncbi_datasets
+conda install -c conda-forge ncbi-datasets-cli
+```
+
+Other installation options are in the NCBI datasets package documentation https://www.ncbi.nlm.nih.gov/datasets/docs/v2/command-line-tools/download-and-install/
+
+### Get Genome Assemblies
+Follow the instructions in the ncbi datasets documentation
+
+#### Download large genome data packages
+Use the datasets command-line tool to get large NCBI Datasets genome data packages
+
+If you want to download genome data for 1,000 or more genomes or the genome data package exceeds 15 GB, you’ll need to use the datasets command-line tool (CLI).
+
+First, use the datasets CLI to download an NCBI Datasets genome data package as a dehydrated zip archive that contains only metadata and the location of the data on NCBI servers. Then, extract the zip archive and use rehydration to download sequence and annotation files.
+
+You can get the data in three steps:
+1.  Download a dehydrated data package for a list of 1,000 genome assemblies, given a text file containing a list of assembly accessions. IF you have more than 1,000 I recommend splitting your file into <1,000 at a time, otherwise it will not run (as of 2/3/2026).
+2.  Unzip the downloaded zip archive.
+3.  Rehydrate to get the genome sequences.
+```{}
+datasets download genome accession --inputfile accessions.txt --dehydrated --filename my-genomes.zip
+
+unzip my-genomes.zip -d my-genomes
+
+datasets rehydrate --directory my-genomes/
+```
+
+## SeroSeq 2 run code
+Not all genomes on NCBI have the serotype. Use the following code to identify the serotype using SeroSeq2.
+
+First create the conda environment and activate it
+```{}
+conda create -n seqsero
+conda activate seqsero
+```
+
+Change to the working directory (with cd) to run the next set of code. This will loop over all of the folders that contain the genomes from ncbi and identify the serotype. It puts all of those results folders into a directory (SeroSeq) and creates a combined .tsv file with all of the results. It will also log any failures and the total number of successful runs to ensure it looped through all of your samples. This code was written with ChatGPT (0.05 kWh × 400 g CO₂/kWh ≈ 20 g CO₂). The SeroSeq runs were estimated to be 10-20 kg CO₂ for all 3,914 samples.
+```{}
+#!/bin/bash
+
+# run this from the directory that contains the sample folders
+
+LOGFILE="SeqSero2_failures.log"
+COMBINED_TSV="SeqSero2_all_results.tsv"
+SEQSERO_DIR="SeqSero"
+
+# setup
+mkdir -p "$SEQSERO_DIR"
+> "$LOGFILE"
+> "$COMBINED_TSV"
+
+success_count=0
+header_written=false
+
+for dir in */; do
+    sample=$(basename "$dir")
+
+    # skip the SeqSero output directory itself
+    [[ "$sample" == "SeqSero" ]] && continue
+
+    mapfile -t fnas < <(find "$dir" -maxdepth 1 -type f -name "*.fna")
+
+    # ---- no fna ----
+    if [[ ${#fnas[@]} -eq 0 ]]; then
+        echo "[$(date)] $sample : NO_FNA_FOUND" >> "$LOGFILE"
+        continue
+    fi
+
+    fna="${fnas[0]}"
+    outdir="$SEQSERO_DIR/$sample"
+
+    mkdir -p "$outdir"
+
+    # ---- run SeqSero2 ----
+    SeqSero2_package.py \
+        -m k \
+        -t 4 \
+        -i "$fna" \
+        -d "$outdir" \
+        > /dev/null 2>&1
+
+    exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        echo "[$(date)] $sample : SEQSERO2_FAILED (exit code $exit_code)" >> "$LOGFILE"
+        continue
+    fi
+
+    ((success_count++))
+
+    # ---- locate TSV ----
+    tsv_file=$(find "$outdir" -type f -name "*.tsv" | head -n 1)
+
+    if [[ -z "$tsv_file" ]]; then
+        echo "[$(date)] $sample : TSV_NOT_FOUND" >> "$LOGFILE"
+        continue
+    fi
+
+    # ---- append to combined TSV ----
+    if [[ "$header_written" = false ]]; then
+        head -n 1 "$tsv_file" >> "$COMBINED_TSV"
+        header_written=true
+    fi
+
+    tail -n +2 "$tsv_file" >> "$COMBINED_TSV"
+
+done
+
+# ---- final summary ----
+{
+    echo "----------------------------------------"
+    echo "Run finished: $(date)"
+    echo "Successful SeqSero2 runs: $success_count"
+} >> "$LOGFILE"
+
+```
+
+
+## SISTR Run Code
+Salmonella serovar predictions from whole-genome sequence assemblies by determination of antigen gene and cgMLST gene alleles using BLAST. SISTR documentation can be found here https://github.com/phac-nml/sistr_cmd Compared to SeroSeq, SISTR takes a lot longer to run, somewhere between 5-10 seconds/sample, whereas SeroSeq is <1 second on average.
+
+First create the conda environment and activate it
+```{}
+conda create -n sistrcmd
+conda activate sistrcmd
+```
+
+Change to the working directory (with cd) to run the next set of code. This will loop over all of the folders that contain the genomes and identify the serotype. It puts all of those results folders into a directory (sistr) and creates a combined .tsv file with all of the results. It will also log any failures and the total number of successful runs to ensure it looped through all of your samples. This code was written with ChatGPT (Estimated emissions:~0.4–0.8 grams CO₂e). The SISTR runs were estimated to be 2.6 kg CO₂ for all 3,914 samples.
+```{}
+#!/bin/bash
+
+# run this from the directory that contains the sample folders
+
+LOGFILE="sistr_failures.log"
+COMBINED_TSV="sistr_all_results.tab"
+SISTR_DIR="SISTR"
+
+# setup
+mkdir -p "$SISTR_DIR"
+> "$LOGFILE"
+> "$COMBINED_TSV"
+
+success_count=0
+header_written=false
+
+for dir in */; do
+    sample=$(basename "$dir")
+
+    # skip the SISTR output directory itself
+    [[ "$sample" == "$SISTR_DIR" ]] && continue
+
+    mapfile -t fnas < <(find "$dir" -maxdepth 1 -type f -name "*.fna")
+
+    # ---- no fna ----
+    if [[ ${#fnas[@]} -eq 0 ]]; then
+        echo "[$(date)] $sample : NO_FNA_FOUND" >> "$LOGFILE"
+        continue
+    fi
+
+    fna="${fnas[0]}"
+    outdir="$SISTR_DIR/$sample"
+    outfile="$outdir/${sample}.tab"
+
+    mkdir -p "$outdir"
+
+    # ---- run sistr ----
+    sistr --qc -f tab -o "$outfile" "$fna" > /dev/null 2>&1
+    exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        echo "[$(date)] $sample : SISTR_FAILED (exit code $exit_code)" >> "$LOGFILE"
+        continue
+    fi
+
+    if [[ ! -s "$outfile" ]]; then
+        echo "[$(date)] $sample : OUTPUT_NOT_FOUND_OR_EMPTY" >> "$LOGFILE"
+        continue
+    fi
+
+    ((success_count++))
+
+    # ---- append to combined TSV ----
+    if [[ "$header_written" = false ]]; then
+        head -n 1 "$outfile" >> "$COMBINED_TSV"
+        header_written=true
+    fi
+
+    tail -n +2 "$outfile" >> "$COMBINED_TSV"
+
+done
+
+# ---- final summary ----
+{
+    echo "----------------------------------------"
+    echo "Run finished: $(date)"
+    echo "Successful sistr runs: $success_count"
+} >> "$LOGFILE"
+```
